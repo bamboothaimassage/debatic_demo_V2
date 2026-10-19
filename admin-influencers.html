@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Debatic — อินฟลูเอนเซอร์</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+<div id="root"></div>
+<script src="shared/app.js"></script>
+<script>
+
+/* Influencer program admin: create a unique code per influencer, set their commission
+   (separately from normal players' referral rates), and see how much each one has earned,
+   been paid, and is still owed. Data + maths live in shared/app.js (loadInfluencers,
+   influencerStats). Superadmin and above, same as finance — this is money owed out. */
+let influencers = loadInfluencers();
+let settings = loadSettings();
+let openId = null;
+let newCode = '';
+const PLATFORMS = ['TikTok','YouTube','Facebook','Instagram','X (Twitter)','อื่น ๆ'];
+document.getElementById('root').innerHTML = adminShell('admin-influencers.html', ADMIN_ACCOUNT);
+if(!guardAdminRole('superadmin', 'อินฟลูเอนเซอร์')) throw new Error('บทบาทนี้ไม่มีสิทธิ์เข้าถึงหน้าอินฟลูเอนเซอร์');
+
+function persist(){ saveInfluencers(influencers); }
+function byId(id){ return influencers.find(x=>x.id===id); }
+function fmtDate(ts){ return new Date(ts).toLocaleDateString('th-TH', { day:'numeric', month:'short', year:'2-digit' }); }
+
+/* ---- reward rule inputs: a type picker (% of first deposit / fixed $) + one number ----
+   ruleFieldsHtml(prefix, rule, withDefault) — withDefault adds a "use the default" option
+   (per-influencer override). readRule(prefix) returns {type,value}, or null for "default". */
+function ruleUnit(type){ return type==='fixed' ? '$ ต่อคน' : '% ของยอดฝากครั้งแรก'; }
+function ruleFieldsHtml(prefix, rule, withDefault){
+  const t = rule ? rule.type : 'default';
+  const v = rule ? rule.value : '';
+  return `<div class="rule-row">
+    <select id="${prefix}Type" onchange="onRuleTypeChange('${prefix}')">
+      ${withDefault ? `<option value="default" ${t==='default'?'selected':''}>ใช้ค่าเริ่มต้น (${esc(rewardLabel(influencerDefaultRule(settings)))})</option>` : ''}
+      <option value="percent" ${t==='percent'?'selected':''}>% ของยอดฝากครั้งแรก</option>
+      <option value="fixed" ${t==='fixed'?'selected':''}>จำนวนเงินคงที่ ($ ต่อคน)</option>
+    </select>
+    <div class="rule-val" ${t==='default'?'hidden':''}><input id="${prefix}Val" type="number" min="0" ${t==='fixed'?'step="1"':'max="100" step="0.5"'} value="${v}"><span class="sub" id="${prefix}Unit">${t==='fixed'?'$':'%'}</span></div>
+  </div>`;
+}
+function onRuleTypeChange(prefix){
+  const t = document.getElementById(prefix+'Type').value;
+  const box = document.querySelector('#'+prefix+'Val').closest('.rule-val');
+  const input = document.getElementById(prefix+'Val');
+  box.hidden = t==='default';
+  document.getElementById(prefix+'Unit').textContent = t==='fixed' ? '$' : '%';
+  input.step = t==='fixed' ? '1' : '0.5';
+  if(t==='fixed') input.removeAttribute('max'); else input.max = '100';
+  updateRulePreview();
+}
+function readRule(prefix){
+  const t = document.getElementById(prefix+'Type').value;
+  if(t==='default') return null;
+  let v = Math.max(0, Number(document.getElementById(prefix+'Val').value) || 0);
+  if(t==='percent') v = Math.min(100, v);
+  return { type:t, value:v };
+}
+function updateRulePreview(){
+  const el = document.getElementById('ruleExample');
+  if(!el || !document.getElementById('ifRateType')) return;
+  const c = readRule('ifRate'), f = readRule('ifFriend');
+  el.textContent = `ตัวอย่าง: ลูกค้าสมัครผ่านรหัสแล้วฝากครั้งแรก $200 และเทรด → อินฟลูเอนเซอร์ได้ ${money(rewardFor(200, c))} · ลูกค้าได้โบนัส ${money(rewardFor(200, f))}`;
+}
+function applyRuleToInfluencer(inf, rule){
+  delete inf.commissionPct;
+  if(rule){ inf.commissionType = rule.type; inf.commissionValue = rule.value; }
+  else { delete inf.commissionType; delete inf.commissionValue; }
+}
+function saveRates(){
+  const c = readRule('ifRate'), f = readRule('ifFriend');
+  settings = loadSettings();
+  settings.influencerCommissionType = c.type;
+  if(c.type==='fixed') settings.influencerCommissionFixed = c.value; else settings.influencerCommissionPct = c.value;
+  settings.influencerFriendType = f.type;
+  if(f.type==='fixed') settings.influencerFriendFixed = f.value; else settings.influencerFriendPct = f.value;
+  saveSettings(settings);
+  toast('บันทึกอัตราของอินฟลูเอนเซอร์แล้ว — ไม่กระทบอัตราแนะนำเพื่อนของผู้เล่นทั่วไป');
+  draw();
+}
+function suggestCode(){
+  const name = document.getElementById('niName').value.trim();
+  newCode = generateInfluencerCode(name || 'INF', influencers);
+  document.getElementById('niCode').value = newCode;
+}
+function validCode(code, exceptId){
+  if(code.length < 3){ toast('รหัสต้องมีอย่างน้อย 3 ตัวอักษร (A–Z, 0–9)', true); return false; }
+  if(influencers.some(x=>x.code===code && x.id!==exceptId)){ toast('รหัส '+code+' ถูกใช้แล้ว — เลือกรหัสอื่น', true); return false; }
+  return true;
+}
+function addInfluencer(){
+  const name = document.getElementById('niName').value.trim();
+  if(!name){ toast('กรุณาใส่ชื่ออินฟลูเอนเซอร์', true); return; }
+  let code = normalizeRefCode(document.getElementById('niCode').value) || generateInfluencerCode(name, influencers);
+  if(!validCode(code)) return;
+  const inf = { id:'inf'+Date.now().toString(36), name, platform:document.getElementById('niPlatform').value,
+    contact:document.getElementById('niContact').value.trim(), code, status:'active', createdAt:Date.now(), referrals:[], payouts:[] };
+  applyRuleToInfluencer(inf, readRule('niRate'));
+  influencers.unshift(inf);
+  persist(); newCode = '';
+  toast('เพิ่ม '+name+' แล้ว — รหัส '+code);
+  draw();
+}
+function copyLink(id){
+  const inf = byId(id); const link = influencerLink(inf.code);
+  (navigator.clipboard ? navigator.clipboard.writeText(link) : Promise.reject()).then(()=>toast('คัดลอกลิงก์ของ '+inf.name+' แล้ว'), ()=>{ prompt('คัดลอกลิงก์นี้', link); });
+}
+function recordPayout(id){
+  const inf = byId(id); const st = influencerStats(inf, settings);
+  if(st.owed <= 0.004){ toast('ไม่มียอดค้างจ่าย', true); return; }
+  inf.payouts.unshift({ amount: Math.round(st.owed*100)/100, ts: Date.now(), note:'จ่ายยอดค้างทั้งหมด' });
+  persist(); toast('บันทึกการจ่าย '+money(st.owed)+' ให้ '+inf.name+' แล้ว'); draw();
+}
+function toggleStatus(id){
+  const inf = byId(id); inf.status = inf.status==='active' ? 'paused' : 'active';
+  persist(); toast(inf.status==='active' ? 'เปิดใช้รหัส '+inf.code+' แล้ว' : 'พักรหัส '+inf.code+' แล้ว — ผู้สมัครใหม่จะใช้รหัสนี้ไม่ได้'); draw();
+}
+function saveEdit(id){
+  const inf = byId(id);
+  const code = normalizeRefCode(document.getElementById('edCode_'+id).value);
+  if(!validCode(code, id)) return;
+  inf.code = code;
+  applyRuleToInfluencer(inf, readRule('edRate_'+id+'_'));
+  inf.contact = document.getElementById('edContact_'+id).value.trim();
+  persist(); toast('บันทึกแล้ว'); draw();
+}
+function simulateSignup(id, qualified){
+  const inf = byId(id);
+  const amt = Number(document.getElementById('simAmt_'+id).value) || 0;
+  if(qualified && amt<=0){ toast('กรุณาใส่ยอดฝากครั้งแรก', true); return; }
+  const seed = hashStr(id+Date.now());
+  inf.referrals.unshift({ id:'r'+Date.now().toString(36), name: FAKE_HOLDER_NAMES[seed%FAKE_HOLDER_NAMES.length]+(seed%97), joinedAt: Date.now(), firstDeposit: qualified?amt:0, qualified });
+  persist(); toast(qualified ? 'จำลองผู้สมัครที่ฝาก '+money(amt)+' และเทรดแล้ว' : 'จำลองผู้สมัครใหม่ (ยังไม่ฝาก/เทรด)'); draw();
+}
+function markQualified(id, rid){
+  const inf = byId(id); const r = inf.referrals.find(x=>x.id===rid);
+  const amt = Number(prompt('ยอดฝากครั้งแรกของ '+r.name+' ($)', '100'));
+  if(!(amt>0)) return;
+  r.firstDeposit = amt; r.qualified = true; persist(); draw();
+}
+function removeInfluencer(id){
+  const inf = byId(id);
+  if(!confirm('ลบ '+inf.name+' และประวัติทั้งหมดของรหัส '+inf.code+'?')) return;
+  influencers = influencers.filter(x=>x.id!==id); if(openId===id) openId=null; persist(); toast('ลบแล้ว'); draw();
+}
+function toggleOpen(id){ openId = openId===id ? null : id; draw(); }
+
+function detailHtml(inf){
+  const st = influencerStats(inf, settings);
+  return `<tr class="row-expand"><td colspan="8"><div class="inf-detail">
+    <div class="inf-detail-grid">
+      <div>
+        <h4>ผู้สมัครผ่านรหัสนี้ (${inf.referrals.length})</h4>
+        ${inf.referrals.length ? `<div class="table-wrap"><table>
+          <tr><th>ชื่อ</th><th>สมัครเมื่อ</th><th>สถานะ</th><th>ยอดฝากครั้งแรก</th><th>ค่าคอมมิชชัน</th></tr>
+          ${inf.referrals.map(r=>`<tr><td>${esc(r.name)}</td><td class="sub">${fmtDate(r.joinedAt)}</td>
+            <td>${r.qualified ? '<span class="badge badge-yes">ผ่านเงื่อนไข</span>' : `<span class="badge badge-warn">รอฝาก/เทรด</span> <button class="btn btn-sm btn-ghost" onclick="markQualified('${inf.id}','${r.id}')">ทำเครื่องหมายว่าผ่าน</button>`}</td>
+            <td class="mono">${r.qualified?money(r.firstDeposit):'—'}</td><td class="mono">${r.qualified?money(rewardFor(r.firstDeposit, st.rule)):'—'}</td></tr>`).join('')}
+        </table></div>` : '<p class="sub">ยังไม่มีผู้สมัครผ่านรหัสนี้</p>'}
+      </div>
+      <div>
+        <h4>แก้ไข</h4>
+        <div class="field"><label>รหัส</label><input id="edCode_${inf.id}" type="text" value="${esc(inf.code)}" maxlength="16" style="text-transform:uppercase;"></div>
+        <div class="field"><label>ค่าคอมมิชชันเฉพาะคนนี้</label>${ruleFieldsHtml('edRate_'+inf.id+'_', hasOwnInfluencerRule(inf) ? influencerRule(inf, settings) : null, true)}</div>
+        <div class="field"><label>ช่องทางติดต่อ</label><input id="edContact_${inf.id}" type="text" value="${esc(inf.contact||'')}"></div>
+        <button class="btn btn-primary btn-sm" onclick="saveEdit('${inf.id}')">บันทึก</button>
+        <h4 style="margin-top:18px;">ประวัติการจ่ายเงิน</h4>
+        ${inf.payouts.length ? inf.payouts.map(p=>`<div class="inf-payout"><span>${fmtDate(p.ts)} · ${esc(p.note||'')}</span><span class="mono">${money(p.amount)}</span></div>`).join('') : '<p class="sub">ยังไม่เคยจ่าย</p>'}
+        <h4 style="margin-top:18px;">จำลองผู้สมัคร (สำหรับสาธิต)</h4>
+        <div class="inline-form"><input id="simAmt_${inf.id}" type="number" min="1" placeholder="ยอดฝากครั้งแรก $" value="200">
+          <button class="btn btn-sm btn-outline" onclick="simulateSignup('${inf.id}', true)">สมัคร + ฝาก + เทรด</button>
+          <button class="btn btn-sm btn-ghost" onclick="simulateSignup('${inf.id}', false)">สมัครอย่างเดียว</button></div>
+        <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);">
+          <button class="btn btn-sm btn-ghost" style="color:var(--no-strong);" onclick="removeInfluencer('${inf.id}')">${iconTrash()}ลบอินฟลูเอนเซอร์นี้</button>
+        </div>
+      </div>
+    </div>
+  </div></td></tr>`;
+}
+
+function draw(){
+  settings = loadSettings();
+  const all = influencers.map(i=>({ i, st: influencerStats(i, settings) }));
+  const sum = k => all.reduce((s,x)=>s+x.st[k], 0);
+  document.getElementById('view').innerHTML = `
+    <div class="view-header"><h1>อินฟลูเอนเซอร์</h1><div class="sub">สร้างรหัสเฉพาะให้แต่ละคน ตั้งค่าคอมมิชชันแยกจากผู้เล่นทั่วไป และดูยอดที่ต้องจ่าย</div></div>
+    <div class="page-note">อินฟลูเอนเซอร์ได้ส่วนแบ่ง (เป็น % ของยอดฝากครั้งแรก หรือจำนวนเงินคงที่ต่อคน) จากผู้ที่สมัครผ่านรหัส เมื่อคนนั้นสมัครและเทรดครั้งแรกแล้ว (เงื่อนไขเดียวกับการแนะนำเพื่อนของผู้เล่น แต่ใช้อัตราแยก) — ข้อมูลบันทึกในเบราว์เซอร์นี้เท่านั้น ทีมพัฒนาฝั่งหลังบ้านจะเชื่อมกับระบบสมัครและการจ่ายเงินจริงภายหลัง</div>
+
+    <div class="kpi-grid">
+      <div class="card kpi-tile"><span class="k">อินฟลูเอนเซอร์</span><span class="v">${influencers.length}</span><span class="sub" style="font-size:12px;">ใช้งานอยู่ ${influencers.filter(i=>i.status==='active').length}</span></div>
+      <div class="card kpi-tile"><span class="k">ผู้สมัครผ่านรหัส</span><span class="v">${sum('signups')}</span><span class="sub" style="font-size:12px;">ผ่านเงื่อนไข ${sum('qualified')}</span></div>
+      <div class="card kpi-tile"><span class="k">ยอดฝากครั้งแรกรวม</span><span class="v mono">${money(sum('deposits'))}</span></div>
+      <div class="card kpi-tile"><span class="k">ค่าคอมมิชชันรวม</span><span class="v mono">${money(sum('earned'))}</span><span class="sub" style="font-size:12px;">จ่ายแล้ว ${money(sum('paid'))}</span></div>
+      <div class="card kpi-tile"><span class="k">ค้างจ่าย</span><span class="v mono" style="color:var(--warn);">${money(sum('owed'))}</span></div>
+    </div>
+
+    <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:24px;">
+      <div class="card" style="flex:1;min-width:300px;padding:20px;">
+        <h3 style="font-size:15px;margin-bottom:6px;">อัตราของอินฟลูเอนเซอร์</h3>
+        <p class="sub" style="font-size:12px;margin-bottom:12px;">เลือกได้ว่าจะให้เป็น % ของยอดฝากครั้งแรก หรือเป็นจำนวนเงินคงที่ต่อคน — แยกจากผู้เล่นทั่วไป (ผู้เล่นทั่วไปตอนนี้: ผู้แนะนำ ${settings.referralReferrerPct||0}% · เพื่อนที่สมัคร ${settings.referralFriendPct||0}% — แก้ได้ที่หน้าตั้งค่าระบบ)</p>
+        <div class="field"><label for="ifRateType">ค่าคอมมิชชันเริ่มต้นของอินฟลูเอนเซอร์ (ต่อลูกค้า 1 คนที่ผ่านเงื่อนไข)</label>${ruleFieldsHtml('ifRate', influencerDefaultRule(settings), false)}</div>
+        <div class="field"><label for="ifFriendType">โบนัสต้อนรับลูกค้าที่สมัครผ่านรหัสอินฟลูเอนเซอร์</label>${ruleFieldsHtml('ifFriend', influencerFriendRule(settings), false)}</div>
+        <p class="sub" id="ruleExample" style="font-size:11.5px;margin:-4px 0 12px;"></p>
+        <button class="btn btn-primary btn-sm" onclick="saveRates()">บันทึกอัตรา</button>
+      </div>
+      <div class="card" style="flex:1.4;min-width:320px;padding:20px;">
+        <h3 style="font-size:15px;margin-bottom:12px;">เพิ่มอินฟลูเอนเซอร์</h3>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <div class="field" style="flex:1.4;min-width:180px;"><label for="niName">ชื่อ</label><input id="niName" type="text" placeholder="ชื่อช่อง / ชื่อเล่น"></div>
+          <div class="field" style="flex:1;min-width:130px;"><label for="niPlatform">แพลตฟอร์ม</label><select id="niPlatform">${PLATFORMS.map(p=>`<option>${p}</option>`).join('')}</select></div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <div class="field" style="flex:1.4;min-width:180px;"><label for="niContact">ช่องทางติดต่อ (ไม่บังคับ)</label><input id="niContact" type="text" placeholder="@handle, อีเมล หรือเบอร์โทร"></div>
+        </div>
+        <div class="field"><label for="niRateType">ค่าคอมมิชชันเฉพาะคน</label>${ruleFieldsHtml('niRate', null, true)}</div>
+        <div class="field"><label for="niCode">รหัสแนะนำ (ไม่ซ้ำกัน)</label>
+          <div class="inline-form"><input id="niCode" type="text" maxlength="16" placeholder="เว้นว่างให้ระบบสร้างให้" value="${esc(newCode)}" style="text-transform:uppercase;"><button class="btn btn-sm btn-outline" onclick="suggestCode()">สุ่มรหัส</button></div>
+        </div>
+        <button class="btn btn-primary" onclick="addInfluencer()">+ เพิ่มและสร้างรหัส</button>
+      </div>
+    </div>
+
+    <div class="card table-wrap"><table>
+      <tr><th>อินฟลูเอนเซอร์</th><th>รหัส</th><th>ค่าคอมฯ</th><th>ผู้สมัคร</th><th>ยอดฝากครั้งแรก</th><th>ได้รับ / จ่ายแล้ว</th><th>ค้างจ่าย</th><th></th></tr>
+      ${all.length ? all.map(({i, st})=>`<tr>
+        <td><b>${esc(i.name)}</b><div class="sub" style="font-size:11.5px;">${esc(i.platform)}${i.contact?' · '+esc(i.contact):''}</div></td>
+        <td><span class="inf-code">${esc(i.code)}</span>${i.status!=='active'?' <span class="badge badge-warn">พักไว้</span>':''}<div><button class="btn btn-sm btn-ghost" style="padding:2px 0;" onclick="copyLink('${i.id}')">คัดลอกลิงก์</button></div></td>
+        <td class="mono">${esc(rewardLabel(st.rule))}${hasOwnInfluencerRule(i)?'':'<div class="sub" style="font-size:11px;">ค่าเริ่มต้น</div>'}</td>
+        <td class="mono">${st.qualified} / ${st.signups}<div class="sub" style="font-size:11px;">ผ่าน / ทั้งหมด</div></td>
+        <td class="mono">${money(st.deposits)}</td>
+        <td class="mono">${money(st.earned)}<div class="sub" style="font-size:11px;">จ่ายแล้ว ${money(st.paid)}</div></td>
+        <td class="mono" style="font-weight:700;color:${st.owed>0?'var(--warn)':'var(--muted)'};">${money(st.owed)}</td>
+        <td><div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <button class="btn btn-sm btn-yes" onclick="recordPayout('${i.id}')" ${st.owed>0?'':'disabled'}>บันทึกว่าจ่ายแล้ว</button>
+          <button class="btn btn-sm" onclick="toggleOpen('${i.id}')">${openId===i.id?'ปิด':'รายละเอียด'}</button>
+          <button class="btn btn-sm btn-ghost" onclick="toggleStatus('${i.id}')">${i.status==='active'?'พักรหัส':'เปิดใช้'}</button>
+        </div></td>
+      </tr>${openId===i.id ? detailHtml(i) : ''}`).join('') : `<tr><td colspan="8">${emptyState('★','ยังไม่มีอินฟลูเอนเซอร์','เพิ่มคนแรกจากฟอร์มด้านบน')}</td></tr>`}
+    </table></div>
+  `;
+  updateRulePreview();
+  ['ifRateVal','ifFriendVal'].forEach(id=>{ const el=document.getElementById(id); if(el) el.addEventListener('input', updateRulePreview); });
+}
+draw();
+
+</script>
+</body>
+</html>
